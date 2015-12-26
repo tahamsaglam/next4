@@ -54,6 +54,7 @@ enum s3c24xx_i2c_state {
 enum s3c24xx_i2c_type {
 	TYPE_S3C2410,
 	TYPE_S3C2440,
+	TYPE_S3C2440_HDMIPHY,
 };
 
 struct s3c24xx_i2c {
@@ -84,6 +85,25 @@ struct s3c24xx_i2c {
 };
 
 /* default platform data removed, dev should always carry data. */
+#define FEATURE_TW_I2C_CLOCK_CHANG
+#if defined(FEATURE_TW_I2C_CLOCK_CHANG)
+struct t10_i2c {
+ int num_bus;
+ struct s3c24xx_i2c *i2c;
+};
+static struct t10_i2c t10s_i2c_backup[10];
+#endif
+
+static inline void dump_i2c_register(struct s3c24xx_i2c *i2c)
+{
+	dev_dbg(i2c->dev, "Register dump(%d) : %x %x %x %x %x\n"
+		, i2c->suspended
+		, readl(i2c->regs + S3C2410_IICCON)
+		, readl(i2c->regs + S3C2410_IICSTAT)
+		, readl(i2c->regs + S3C2410_IICADD)
+		, readl(i2c->regs + S3C2410_IICDS)
+		, readl(i2c->regs + S3C2440_IICLC) );
+}
 
 /* s3c24xx_i2c_is2440()
  *
@@ -96,7 +116,20 @@ static inline int s3c24xx_i2c_is2440(struct s3c24xx_i2c *i2c)
 	enum s3c24xx_i2c_type type;
 
 	type = platform_get_device_id(pdev)->driver_data;
-	return type == TYPE_S3C2440;
+	return type == TYPE_S3C2440 || type == TYPE_S3C2440_HDMIPHY;
+}
+
+/* s3c24xx_i2c_is2440_hdmiphy()
+ *
+ * return true is this is an s3c2440 dedicated for HDMIPHY interface
+*/
+static inline int s3c24xx_i2c_is2440_hdmiphy(struct s3c24xx_i2c *i2c)
+{
+	struct platform_device *pdev = to_platform_device(i2c->dev);
+	enum s3c24xx_i2c_type type;
+
+	type = platform_get_device_id(pdev)->driver_data;
+	return type == TYPE_S3C2440_HDMIPHY;
 }
 
 /* s3c24xx_i2c_master_complete
@@ -201,18 +234,29 @@ static void s3c24xx_i2c_message_start(struct s3c24xx_i2c *i2c,
 
 static inline void s3c24xx_i2c_stop(struct s3c24xx_i2c *i2c, int ret)
 {
-	unsigned long iicstat = readl(i2c->regs + S3C2410_IICSTAT);
+	unsigned long iicstat;
+	unsigned long iiccon;
 
 	dev_dbg(i2c->dev, "STOP\n");
 
 	/* stop the transfer */
+
+	/* Disable irq */
+	s3c24xx_i2c_disable_irq(i2c);
+
+	/* STOP signal generation : MTx(0xD0) */
+	iicstat = readl(i2c->regs + S3C2410_IICSTAT);
 	iicstat &= ~S3C2410_IICSTAT_START;
 	writel(iicstat, i2c->regs + S3C2410_IICSTAT);
 
-	i2c->state = STATE_STOP;
+	/* Clear pending bit */
+	iiccon = readl(i2c->regs + S3C2410_IICCON);
+	iiccon &= ~S3C2410_IICCON_IRQPEND;
+	writel(iiccon, i2c->regs + S3C2410_IICCON);
 
 	s3c24xx_i2c_master_complete(i2c, ret);
-	s3c24xx_i2c_disable_irq(i2c);
+
+	i2c->state = STATE_STOP;
 }
 
 /* helper functions to determine the current state in the set of
@@ -348,12 +392,21 @@ static int i2c_s3c_irq_nextbyte(struct s3c24xx_i2c *i2c, unsigned long iicstat)
 					 * forces us to send a new START
 					 * when we change direction */
 
+					dev_dbg(i2c->dev, "Cannot do this\n");
 					s3c24xx_i2c_stop(i2c, -EINVAL);
 				}
 
+				/* For multiple messages,
+				 * ex)
+				 * Msg[0]: Slave Addr + Write(Addr)
+				 * Msg[1]: Write(Data) */
 				goto retry_write;
 			} else {
 				/* send the new start */
+				/* For multiple messages,
+				 * ex)
+				 * Msg[0]: Slave Addr + Write(Addr)
+				 * Msg[1]: Slave Addr + Read/Write(Data) */
 				s3c24xx_i2c_message_start(i2c, i2c->msg);
 				i2c->state = STATE_START;
 			}
@@ -424,6 +477,8 @@ static irqreturn_t s3c24xx_i2c_irq(int irqno, void *dev_id)
 	unsigned long status;
 	unsigned long tmp;
 
+	spin_lock(&i2c->lock);
+
 	status = readl(i2c->regs + S3C2410_IICSTAT);
 
 	if (status & S3C2410_IICSTAT_ARBITR) {
@@ -446,6 +501,8 @@ static irqreturn_t s3c24xx_i2c_irq(int irqno, void *dev_id)
 	i2c_s3c_irq_nextbyte(i2c, status);
 
  out:
+	spin_unlock(&i2c->lock);
+
 	return IRQ_HANDLED;
 }
 
@@ -490,6 +547,7 @@ static int s3c24xx_i2c_doxfer(struct s3c24xx_i2c *i2c,
 	ret = s3c24xx_i2c_set_master(i2c);
 	if (ret != 0) {
 		dev_err(i2c->dev, "cannot get bus (error %d)\n", ret);
+		dump_i2c_register(i2c);
 		ret = -EAGAIN;
 		goto out;
 	}
@@ -514,9 +572,15 @@ static int s3c24xx_i2c_doxfer(struct s3c24xx_i2c *i2c,
 	 * noisy when doing an i2cdetect */
 
 	if (timeout == 0)
+	{
 		dev_dbg(i2c->dev, "timeout\n");
+		dump_i2c_register(i2c);
+	}
 	else if (ret != num)
+	{
 		dev_dbg(i2c->dev, "incomplete xfer (%d)\n", ret);
+		dump_i2c_register(i2c);
+	}
 
 	/* ensure the stop has been through the bus */
 
@@ -529,12 +593,28 @@ static int s3c24xx_i2c_doxfer(struct s3c24xx_i2c *i2c,
 
 	/* if that timed out sleep */
 	if (!spins) {
-		msleep(1);
+		usleep_range(1000, 1000);
 		iicstat = readl(i2c->regs + S3C2410_IICSTAT);
 	}
 
-	if (iicstat & S3C2410_IICSTAT_START)
-		dev_warn(i2c->dev, "timeout waiting for bus idle\n");
+	/* if still not finished, clean it up */
+	spin_lock_irq(&i2c->lock);
+
+	if (iicstat & S3C2410_IICSTAT_BUSBUSY) {
+		dev_dbg(i2c->dev, "timeout waiting for bus idle\n");
+		dump_i2c_register(i2c);
+
+		if (i2c->state != STATE_STOP) {
+			dev_dbg(i2c->dev, "timeout : i2c interrupt hasn't occurred\n");
+			s3c24xx_i2c_stop(i2c, 0);
+		}
+
+		/* Disable Serial Out : To forcely terminate the connection */
+		iicstat = readl(i2c->regs + S3C2410_IICSTAT);
+		iicstat &= ~S3C2410_IICSTAT_TXRXEN;
+		writel(iicstat, i2c->regs + S3C2410_IICSTAT);
+	}
+	spin_unlock_irq(&i2c->lock);
 
  out:
 	return ret;
@@ -552,6 +632,13 @@ static int s3c24xx_i2c_xfer(struct i2c_adapter *adap,
 	struct s3c24xx_i2c *i2c = (struct s3c24xx_i2c *)adap->algo_data;
 	int retry;
 	int ret;
+
+	if (i2c->suspended)
+	{
+		dev_err(i2c->dev, "I2C is not initialzed.\n");
+		dump_i2c_register(i2c);
+		return -EIO;
+	}
 
 	clk_enable(i2c->clk);
 
@@ -710,7 +797,7 @@ static int s3c24xx_i2c_cpufreq_transition(struct notifier_block *nb,
 		if (ret < 0)
 			dev_err(i2c->dev, "cannot find frequency\n");
 		else
-			dev_info(i2c->dev, "setting freq %d\n", got);
+			dev_dbg(i2c->dev, "setting freq %d\n", got);
 	}
 
 	return 0;
@@ -765,7 +852,7 @@ static int s3c24xx_i2c_init(struct s3c24xx_i2c *i2c)
 
 	writeb(pdata->slave_addr, i2c->regs + S3C2410_IICADD);
 
-	dev_info(i2c->dev, "slave address 0x%02x\n", pdata->slave_addr);
+	dev_dbg(i2c->dev, "slave address 0x%02x\n", pdata->slave_addr);
 
 	writel(iicon, i2c->regs + S3C2410_IICCON);
 
@@ -779,7 +866,7 @@ static int s3c24xx_i2c_init(struct s3c24xx_i2c *i2c)
 
 	/* todo - check that the i2c lines aren't being dragged anywhere */
 
-	dev_info(i2c->dev, "bus frequency set to %d KHz\n", freq);
+	dev_dbg(i2c->dev, "bus frequency set to %d KHz\n", freq);
 	dev_dbg(i2c->dev, "S3C2410_IICCON=0x%02lx\n", iicon);
 
 	return 0;
@@ -789,7 +876,75 @@ static int s3c24xx_i2c_init(struct s3c24xx_i2c *i2c)
  *
  * called by the bus driver when a suitable device is found
 */
+#if defined(FEATURE_TW_I2C_CLOCK_CHANG)
+int s3c24xx_i2c_set(int num, int slave, int setfreq)
+{
+	unsigned long iicon = S3C2410_IICCON_IRQEN | S3C2410_IICCON_ACKEN;
+	unsigned int freq;
+	unsigned long clkin = clk_get_rate(t10s_i2c_backup[num].i2c->clk);
+	unsigned int divs, div1;
+	unsigned long siicon =0;
+	/* get the plafrom data */
 
+	clk_enable(t10s_i2c_backup[num].i2c->clk);
+
+	/* write slave address */
+	clkin /= 1000;		/* clkin now in KHz */
+
+	writeb(slave, t10s_i2c_backup[num].i2c->regs+ S3C2410_IICADD);
+
+	printk( "i2c num =%d slave address 0x%02x  setfreq=%d \n",num,  slave,setfreq);
+
+	writel(iicon, t10s_i2c_backup[num].i2c->regs+ S3C2410_IICCON);
+
+	/* we need to work out the divisors for the clock... */
+
+	//printk( "pdata desired setfreq frequency %lu t10s_i2c_backup[num].i2c->clkrate=%lu clkin=%lu \n", setfreq,t10s_i2c_backup[num].i2c->clkrate,clkin);
+
+	freq = s3c24xx_i2c_calcdivisor(clkin, setfreq, &div1, &divs);
+
+	siicon = readl(t10s_i2c_backup[num].i2c->regs + S3C2410_IICCON);
+	siicon &= ~(S3C2410_IICCON_SCALEMASK | S3C2410_IICCON_TXDIV_512);
+	siicon |= (divs-1);
+
+	if (div1 == 512)
+		siicon |= S3C2410_IICCON_TXDIV_512;
+
+	writel(siicon, t10s_i2c_backup[num].i2c->regs + S3C2410_IICCON);
+
+	{
+		unsigned long sda_delay=0;
+
+			sda_delay = clkin * (S3C2410_IICLC_SDA_DELAY5 | S3C2410_IICLC_FILTER_ON);
+			sda_delay = DIV_ROUND_UP(sda_delay, 1000000);
+			sda_delay = DIV_ROUND_UP(sda_delay, 5);
+			if (sda_delay > 3)
+				sda_delay = 3;
+			sda_delay |= S3C2410_IICLC_FILTER_ON;
+
+
+		printk( "IICLC=%08lx\n", sda_delay);
+		writel(sda_delay,t10s_i2c_backup[num].i2c->regs + S3C2440_IICLC);
+	}
+	/* todo - check that the i2c lines aren't being dragged anywhere */
+
+	printk( "bus frequency set to %d KHz\n", freq);
+	printk( "S3C2410_IICCON=0x%02lx\n", iicon);
+	clk_disable(t10s_i2c_backup[num].i2c->clk);
+
+	return 0;
+}
+EXPORT_SYMBOL(s3c24xx_i2c_set);
+
+void t10s_i2c_clockrate(int i2c_num)
+{
+
+	clk_enable(t10s_i2c_backup[i2c_num].i2c->clk);
+	s3c24xx_i2c_init(t10s_i2c_backup[i2c_num].i2c);
+	clk_disable(t10s_i2c_backup[i2c_num].i2c->clk);
+}
+EXPORT_SYMBOL(t10s_i2c_clockrate);
+#endif
 static int s3c24xx_i2c_probe(struct platform_device *pdev)
 {
 	struct s3c24xx_i2c *i2c;
@@ -913,6 +1068,13 @@ static int s3c24xx_i2c_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, i2c);
 
+#if defined(FEATURE_TW_I2C_CLOCK_CHANG)
+	if(pdata->bus_num<10)
+	{
+		t10s_i2c_backup[pdata->bus_num].num_bus= pdata->bus_num;
+		t10s_i2c_backup[pdata->bus_num].i2c=i2c;
+	}
+#endif
 	dev_info(&pdev->dev, "%s: S3C I2C adapter\n", dev_name(&i2c->adap.dev));
 	clk_disable(i2c->clk);
 	return 0;
@@ -976,22 +1138,27 @@ static int s3c24xx_i2c_suspend_noirq(struct device *dev)
 	return 0;
 }
 
-static int s3c24xx_i2c_resume(struct device *dev)
+static int s3c24xx_i2c_resume_noirq(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct s3c24xx_i2c *i2c = platform_get_drvdata(pdev);
 
-	i2c->suspended = 0;
 	clk_enable(i2c->clk);
 	s3c24xx_i2c_init(i2c);
 	clk_disable(i2c->clk);
+	i2c->suspended = 0;
 
 	return 0;
 }
 
 static const struct dev_pm_ops s3c24xx_i2c_dev_pm_ops = {
 	.suspend_noirq = s3c24xx_i2c_suspend_noirq,
-	.resume = s3c24xx_i2c_resume,
+	.resume_noirq = s3c24xx_i2c_resume_noirq,
+#ifdef CONFIG_HIBERNATION
+	.freeze_noirq = s3c24xx_i2c_suspend_noirq,
+	.thaw_noirq = s3c24xx_i2c_resume_noirq,
+	.restore_noirq = s3c24xx_i2c_resume_noirq,
+#endif
 };
 
 #define S3C24XX_DEV_PM_OPS (&s3c24xx_i2c_dev_pm_ops)
@@ -1008,6 +1175,9 @@ static struct platform_device_id s3c24xx_driver_ids[] = {
 	}, {
 		.name		= "s3c2440-i2c",
 		.driver_data	= TYPE_S3C2440,
+	}, {
+		.name		= "s3c2440-hdmiphy-i2c",
+		.driver_data	= TYPE_S3C2440_HDMIPHY,
 	}, { },
 };
 MODULE_DEVICE_TABLE(platform, s3c24xx_driver_ids);

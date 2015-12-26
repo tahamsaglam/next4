@@ -2605,6 +2605,10 @@ static int check_module_license_and_versions(struct module *mod)
 	if (strcmp(mod->name, "driverloader") == 0)
 		add_taint_module(mod, TAINT_PROPRIETARY_MODULE);
 
+	/* lve claims to be GPL but upstream won't provide source */
+	if (strcmp(mod->name, "lve") == 0)
+		add_taint_module(mod, TAINT_PROPRIETARY_MODULE);
+
 #ifdef CONFIG_MODVERSIONS
 	if ((mod->num_syms && !mod->crcs)
 	    || (mod->num_gpl_syms && !mod->gpl_crcs)
@@ -2649,13 +2653,13 @@ static struct module *layout_and_allocate(struct load_info *info)
 	/* Module within temporary copy. */
 	struct module *mod;
 	Elf_Shdr *pcpusec;
-	int err;
+	int err = 0;
 
 	mod = setup_load_info(info);
 	if (IS_ERR(mod))
 		return mod;
 
-	err = check_modinfo(mod, info);
+	//err = check_modinfo(mod, info);
 	if (err)
 		return ERR_PTR(err);
 

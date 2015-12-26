@@ -10,10 +10,13 @@
  * published by the Free Software Foundation.
 */
 
+#include <plat/clock.h>
 #include <plat/regs-watchdog.h>
 #include <mach/map.h>
 
+#include <linux/kernel.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/io.h>
 

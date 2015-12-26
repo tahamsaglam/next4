@@ -30,6 +30,18 @@
 
 #include "usb.h"
 
+#ifdef CONFIG_USBHUB_USB3503
+#define NOTIFY_LAN9514_DETECT
+
+#ifdef NOTIFY_LAN9514_DETECT
+#define LAN9514_VID 0x0424
+#define LAN9514_PID 0x9514
+extern void change_dock_switch_state(int conn);
+extern void dock_hub_status(int is_dock);
+int lan9514_devnum = 0;
+#endif
+#endif
+
 /* if we are in debug mode, always announce new devices */
 #ifdef DEBUG
 #ifndef CONFIG_USB_ANNOUNCE_NEW_DEVICES
@@ -481,12 +493,15 @@ static void hub_tt_work(struct work_struct *work)
 	int			limit = 100;
 
 	spin_lock_irqsave (&hub->tt.lock, flags);
-	while (--limit && !list_empty (&hub->tt.clear_list)) {
+	while (!list_empty(&hub->tt.clear_list)) {
 		struct list_head	*next;
 		struct usb_tt_clear	*clear;
 		struct usb_device	*hdev = hub->hdev;
 		const struct hc_driver	*drv;
 		int			status;
+
+		if (!hub->quiescing && --limit < 0)
+			break;
 
 		next = hub->tt.clear_list.next;
 		clear = list_entry (next, struct usb_tt_clear, clear_list);
@@ -951,7 +966,7 @@ static void hub_quiesce(struct usb_hub *hub, enum hub_quiescing_type type)
 	if (hub->has_indicators)
 		cancel_delayed_work_sync(&hub->leds);
 	if (hub->tt.hub)
-		cancel_work_sync(&hub->tt.clear_work);
+		flush_work_sync(&hub->tt.clear_work);
 }
 
 /* caller has locked the hub device */
@@ -1677,6 +1692,14 @@ void usb_disconnect(struct usb_device **pdev)
 	usb_remove_ep_devs(&udev->ep0);
 	usb_unlock_device(udev);
 
+#ifdef NOTIFY_LAN9514_DETECT
+	if(udev->devnum==lan9514_devnum){
+		dev_info(&udev->dev,"%s LAN9514 Disconnected !(%d) \n",__func__,udev->devnum);
+		dock_hub_status(0);
+		change_dock_switch_state(0);
+	}
+#endif
+
 	/* Unregister the device.  The device driver is responsible
 	 * for de-configuring the device and invoking the remove-device
 	 * notifier chain (used by usbfs and possibly others).
@@ -1916,6 +1939,16 @@ int usb_new_device(struct usb_device *udev)
 	(void) usb_create_ep_devs(&udev->dev, &udev->ep0, udev);
 	usb_mark_last_busy(udev);
 	pm_runtime_put_sync_autosuspend(&udev->dev);
+
+#ifdef NOTIFY_LAN9514_DETECT
+	if(le16_to_cpu(udev->descriptor.idVendor) == LAN9514_VID && le16_to_cpu(udev->descriptor.idProduct == LAN9514_PID)){
+		lan9514_devnum = udev->devnum;
+		dev_info(&udev->dev,"%s LAN9514 Connected @ (%d) \n",__func__,udev->devnum);
+		dock_hub_status(1);
+		change_dock_switch_state(1);
+	}
+#endif
+
 	return err;
 
 fail:

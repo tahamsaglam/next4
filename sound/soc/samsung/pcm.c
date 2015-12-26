@@ -17,6 +17,9 @@
 #include <sound/soc.h>
 #include <sound/pcm_params.h>
 
+#include <mach/regs-audss.h>
+#include <mach/regs-clock.h>
+
 #include <plat/audio.h>
 #include <plat/dma.h>
 
@@ -128,6 +131,9 @@ struct s3c_pcm_info {
 
 	struct s3c_dma_params	*dma_playback;
 	struct s3c_dma_params	*dma_capture;
+
+	u32	suspend_pcmctl;
+	u32	suspend_pcmclkctl;
 };
 
 static struct s3c2410_dma_client s3c_pcm_dma_client_out = {
@@ -276,11 +282,14 @@ static int s3c_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct s3c_dma_params *dma_data;
 	void __iomem *regs = pcm->regs;
 	struct clk *clk;
-	int sclk_div, sync_div;
+	int sclk_div = 0, sync_div = 0;
 	unsigned long flags;
 	u32 clkctl;
 
 	dev_dbg(pcm->dev, "Entered %s\n", __func__);
+
+	clk_enable(pcm->cclk);
+	clk_enable(pcm->pclk);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		dma_data = pcm->dma_playback;
@@ -288,6 +297,23 @@ static int s3c_pcm_hw_params(struct snd_pcm_substream *substream,
 		dma_data = pcm->dma_capture;
 
 	snd_soc_dai_set_dma_data(rtd->cpu_dai, substream, dma_data);
+
+	switch (params_channels(params)) {
+	case 1:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			pcm->dma_playback->dma_size = 2;
+		else
+			pcm->dma_capture->dma_size = 2;
+		break;
+	case 2:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			pcm->dma_playback->dma_size = 4;
+		else
+			pcm->dma_capture->dma_size = 4;
+		break;
+	default:
+		break;
+	}
 
 	/* Strictly check for sample size */
 	switch (params_format(params)) {
@@ -306,6 +332,10 @@ static int s3c_pcm_hw_params(struct snd_pcm_substream *substream,
 	else
 		clk = pcm->cclk;
 
+	if (clk_get_rate(clk) != (pcm->sclk_per_fs*params_rate(params)))
+		clk_set_rate(clk, pcm->sclk_per_fs*params_rate(params));
+
+#if defined(CONFIG_ARCH_S5PC100) || defined(CONFIG_ARCH_S5PV210)
 	/* Set the SCLK divider */
 	sclk_div = clk_get_rate(clk) / pcm->sclk_per_fs /
 					params_rate(params) / 2 - 1;
@@ -314,6 +344,7 @@ static int s3c_pcm_hw_params(struct snd_pcm_substream *substream,
 			<< S3C_PCM_CLKCTL_SCLKDIV_SHIFT);
 	clkctl |= ((sclk_div & S3C_PCM_CLKCTL_SCLKDIV_MASK)
 			<< S3C_PCM_CLKCTL_SCLKDIV_SHIFT);
+#endif
 
 	/* Set the SYNC divider */
 	sync_div = pcm->sclk_per_fs - 1;
@@ -330,6 +361,17 @@ static int s3c_pcm_hw_params(struct snd_pcm_substream *substream,
 	dev_dbg(pcm->dev, "PCMSOURCE_CLK-%lu SCLK=%ufs SCLK_DIV=%d SYNC_DIV=%d\n",
 				clk_get_rate(clk), pcm->sclk_per_fs,
 				sclk_div, sync_div);
+
+	return 0;
+}
+
+static int s3c_pcm_hw_free(struct snd_pcm_substream *substream, struct snd_soc_dai *socdai)
+{
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct s3c_pcm_info *pcm = snd_soc_dai_get_drvdata(rtd->cpu_dai);
+
+	clk_disable(pcm->cclk);
+	clk_disable(pcm->pclk);
 
 	return 0;
 }
@@ -451,11 +493,39 @@ static int s3c_pcm_set_sysclk(struct snd_soc_dai *cpu_dai,
 	return 0;
 }
 
+#ifdef CONFIG_PM
+static int s3c_pcm_suspend(struct snd_soc_dai *dai)
+{
+	struct s3c_pcm_info *pcm = snd_soc_dai_get_drvdata(dai);
+	void __iomem *regs = pcm->regs;
+
+	pcm->suspend_pcmctl = readl(regs + S3C_PCM_CTL);
+	pcm->suspend_pcmclkctl = readl(regs + S3C_PCM_CLKCTL);
+
+	return 0;
+}
+
+static int s3c_pcm_resume(struct snd_soc_dai *dai)
+{
+	struct s3c_pcm_info *pcm = snd_soc_dai_get_drvdata(dai);
+	void __iomem *regs = pcm->regs;
+
+	writel(pcm->suspend_pcmctl, regs + S3C_PCM_CTL);
+	writel(pcm->suspend_pcmclkctl, regs + S3C_PCM_CLKCTL);
+
+	return 0;
+}
+#else
+#define s3c_pcm_suspend NULL
+#define s3c_pcm_resume  NULL
+#endif
+
 static struct snd_soc_dai_ops s3c_pcm_dai_ops = {
 	.set_sysclk	= s3c_pcm_set_sysclk,
 	.set_clkdiv	= s3c_pcm_set_clkdiv,
 	.trigger	= s3c_pcm_trigger,
 	.hw_params	= s3c_pcm_hw_params,
+	.hw_free	= s3c_pcm_hw_free,
 	.set_fmt	= s3c_pcm_set_fmt,
 };
 
@@ -465,13 +535,13 @@ static struct snd_soc_dai_ops s3c_pcm_dai_ops = {
 	.symmetric_rates = 1,					\
 	.ops = &s3c_pcm_dai_ops,				\
 	.playback = {						\
-		.channels_min	= 2,				\
+		.channels_min	= 1,				\
 		.channels_max	= 2,				\
 		.rates		= S3C_PCM_RATES,		\
 		.formats	= SNDRV_PCM_FMTBIT_S16_LE,	\
 	},							\
 	.capture = {						\
-		.channels_min	= 2,				\
+		.channels_min	= 1,				\
 		.channels_max	= 2,				\
 		.rates		= S3C_PCM_RATES,		\
 		.formats	= SNDRV_PCM_FMTBIT_S16_LE,	\
@@ -480,10 +550,14 @@ static struct snd_soc_dai_ops s3c_pcm_dai_ops = {
 struct snd_soc_dai_driver s3c_pcm_dai[] = {
 	[0] = {
 		.name	= "samsung-pcm.0",
+		.suspend = s3c_pcm_suspend,
+		.resume = s3c_pcm_resume,
 		S3C_PCM_DAI_DECLARE,
 	},
 	[1] = {
 		.name	= "samsung-pcm.1",
+		.suspend = s3c_pcm_suspend,
+		.resume = s3c_pcm_resume,
 		S3C_PCM_DAI_DECLARE,
 	},
 };
@@ -495,6 +569,8 @@ static __devinit int s3c_pcm_dev_probe(struct platform_device *pdev)
 	struct resource *mem_res, *dmatx_res, *dmarx_res;
 	struct s3c_audio_pdata *pcm_pdata;
 	int ret;
+	char clock_name[10];
+	char clock_id[2];
 
 	/* Check for valid device index */
 	if ((pdev->id < 0) || pdev->id >= ARRAY_SIZE(s3c_pcm)) {
@@ -536,13 +612,16 @@ static __devinit int s3c_pcm_dev_probe(struct platform_device *pdev)
 	/* Default is 128fs */
 	pcm->sclk_per_fs = 128;
 
-	pcm->cclk = clk_get(&pdev->dev, "audio-bus");
+	strcpy (clock_name,"sclk_pcm");
+	sprintf(clock_id,"%d",pdev->id);
+	strcat (clock_name, clock_id);
+	pcm->cclk = clk_get(&pdev->dev, clock_name);
 	if (IS_ERR(pcm->cclk)) {
-		dev_err(&pdev->dev, "failed to get audio-bus\n");
+		dev_err(&pdev->dev, "failed to get sclk_pcm\n");
 		ret = PTR_ERR(pcm->cclk);
 		goto err1;
 	}
-	clk_enable(pcm->cclk);
+	//clk_enable(pcm->cclk); //move to s3c_pcm_hw_params
 
 	/* record our pcm structure for later use in the callbacks */
 	dev_set_drvdata(&pdev->dev, pcm);
@@ -564,10 +643,10 @@ static __devinit int s3c_pcm_dev_probe(struct platform_device *pdev)
 	pcm->pclk = clk_get(&pdev->dev, "pcm");
 	if (IS_ERR(pcm->pclk)) {
 		dev_err(&pdev->dev, "failed to get pcm_clock\n");
-		ret = -ENOENT;
+		ret = PTR_ERR(pcm->pclk);
 		goto err4;
 	}
-	clk_enable(pcm->pclk);
+	//clk_enable(pcm->pclk); //move to s3c_pcm_hw_params
 
 	ret = snd_soc_register_dai(&pdev->dev, &s3c_pcm_dai[pdev->id]);
 	if (ret != 0) {
@@ -624,7 +703,7 @@ static __devexit int s3c_pcm_dev_remove(struct platform_device *pdev)
 
 static struct platform_driver s3c_pcm_driver = {
 	.probe  = s3c_pcm_dev_probe,
-	.remove = s3c_pcm_dev_remove,
+	.remove = __devexit_p(s3c_pcm_dev_remove),
 	.driver = {
 		.name = "samsung-pcm",
 		.owner = THIS_MODULE,
